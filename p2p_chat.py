@@ -260,8 +260,12 @@ class P2PApp:
                                   activeforeground=DARK["accent_fg"])
         self._chat_menu.add_command(label="コピー", command=self._copy_selected)
         self._chat_menu.add_command(label="すべて選択", command=self._select_all)
-        btn = "<Button-2>" if sys.platform == "darwin" else "<Button-3>"
-        self.chat_area.bind(btn, self._show_chat_menu)
+        if sys.platform == "darwin":
+            self.chat_area.bind("<Button-2>",         self._show_chat_menu)
+            self.chat_area.bind("<Button-3>",         self._show_chat_menu)
+            self.chat_area.bind("<Control-Button-1>", self._show_chat_menu)
+        else:
+            self.chat_area.bind("<Button-3>", self._show_chat_menu)
 
         # --- プログレスバー ---
         prog_frame = tk.Frame(self.root, bg=D["bg"], padx=10)
