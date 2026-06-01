@@ -131,7 +131,7 @@ class P2PApp:
         self.root = root
         self.root.title("P2P チャット")
         self.root.geometry("660x780")
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
         self.root.configure(bg=DARK["bg"])
 
         self.conn = None
