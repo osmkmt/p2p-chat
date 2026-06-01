@@ -130,8 +130,8 @@ class P2PApp:
     def __init__(self, root):
         self.root = root
         self.root.title("P2P チャット")
-        self.root.geometry("520x780")
-        self.root.resizable(True, True)
+        self.root.geometry("660x780")
+        self.root.resizable(False, False)
         self.root.configure(bg=DARK["bg"])
 
         self.conn = None
@@ -348,6 +348,27 @@ class P2PApp:
         fg = color or DARK["text"]
         self.status_label.config(text=f"● {text}", fg=fg)
 
+    def _on_disconnected(self):
+        self._set_status("切断 — 再接続できます", DARK["err"])
+        self.connect_btn.config(state=tk.NORMAL)
+        self.wait_btn.config(state=tk.NORMAL)
+        self.conn = None
+
+    def _cleanup_connection(self):
+        """既存の接続・サーバーソケットを閉じる"""
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except Exception:
+                pass
+            self.server_socket = None
+
     def _set_connected(self, ip):
         self.root.after(0, self._set_status, f"接続中: {ip}", DARK["ok"])
         self.root.after(0, self.connect_btn.config, {"state": tk.DISABLED})
@@ -473,6 +494,7 @@ class P2PApp:
     # ================================================================ サーバー待機
 
     def _start_server(self):
+        self._cleanup_connection()
         self.wait_btn.config(state=tk.DISABLED)
         self.connect_btn.config(state=tk.DISABLED)
         self._set_status("待機中...", DARK["warn"])
@@ -501,6 +523,7 @@ class P2PApp:
         if not ip:
             self._log("相手が見つかりません。リストから選ぶか、手動でIPを入力してください。")
             return
+        self._cleanup_connection()
         self.connect_btn.config(state=tk.DISABLED)
         self.wait_btn.config(state=tk.DISABLED)
         self._set_status("接続中...", DARK["warn"])
@@ -566,7 +589,7 @@ class P2PApp:
 
             except Exception as e:
                 self.root.after(0, self._log, f"接続が切れました: {e}")
-                self.root.after(0, self._set_status, "切断", DARK["err"])
+                self.root.after(0, self._on_disconnected)
                 break
 
     def _recv_exact(self, n):
