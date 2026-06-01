@@ -1,11 +1,14 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext
+from tkinterdnd2 import TkinterDnD, DND_FILES
 import socket
 import threading
 import struct
 import os
 import sys
 import time
+import tempfile
+import shutil
 
 # OS別フォント（日本語が確実に表示されるフォントを指定）
 if sys.platform == "win32":
@@ -30,23 +33,24 @@ DISC_MSG  = b'P2PCHAT_HELLO'
 
 # ------------------------------------------------------------------ カラーパレット
 DARK = {
-    "bg":          "#1e1e2e",   # ウィンドウ背景
-    "panel":       "#2a2a3e",   # フレーム背景
-    "border":      "#44475a",   # 枠線
-    "input_bg":    "#313244",   # 入力欄背景
-    "text":        "#cdd6f4",   # 通常テキスト
-    "text_dim":    "#6c7086",   # 薄いテキスト
-    "self_msg":    "#89b4fa",   # 自分のメッセージ（青）
-    "peer_msg":    "#a6e3a1",   # 相手のメッセージ（緑）
-    "system_msg":  "#585b70",   # システムメッセージ
-    "btn_bg":      "#45475a",   # ボタン背景
-    "btn_fg":      "#cdd6f4",   # ボタン文字
-    "btn_active":  "#585b70",   # ボタンホバー
-    "accent":      "#89b4fa",   # アクセント（接続ボタン）
-    "accent_fg":   "#1e1e2e",   # アクセントボタン文字
-    "ok":          "#a6e3a1",   # 緑（接続済み）
-    "warn":        "#fab387",   # オレンジ（待機中）
-    "err":         "#f38ba8",   # 赤（エラー）
+    "bg":          "#1e1e2e",
+    "panel":       "#2a2a3e",
+    "border":      "#44475a",
+    "input_bg":    "#313244",
+    "text":        "#cdd6f4",
+    "text_dim":    "#6c7086",
+    "self_msg":    "#89b4fa",
+    "peer_msg":    "#a6e3a1",
+    "system_msg":  "#585b70",
+    "btn_bg":      "#45475a",
+    "btn_fg":      "#cdd6f4",
+    "btn_active":  "#585b70",
+    "accent":      "#89b4fa",
+    "accent_fg":   "#1e1e2e",
+    "ok":          "#a6e3a1",
+    "warn":        "#fab387",
+    "err":         "#f38ba8",
+    "drop_hover":  "#3a3a5e",
 }
 
 
@@ -56,7 +60,6 @@ class RoundedButton(tk.Canvas):
     def __init__(self, parent, text, command, accent=False,
                  width=None, height=32, radius=10, **kw):
         bg_parent = parent.cget("bg")
-        # width 未指定なら文字数から自動計算（日本語1文字≒14px、余白40px）
         if width is None:
             width = len(text) * 14 + 40
         super().__init__(parent, width=width, height=height,
@@ -75,8 +78,8 @@ class RoundedButton(tk.Canvas):
         self._color_dis    = DARK["border"]
 
         self._draw(self._color_normal)
-        self.bind("<Enter>",        self._on_enter)
-        self.bind("<Leave>",        self._on_leave)
+        self.bind("<Enter>",           self._on_enter)
+        self.bind("<Leave>",           self._on_leave)
         self.bind("<ButtonPress-1>",   self._on_press)
         self.bind("<ButtonRelease-1>", self._on_release)
 
@@ -89,9 +92,8 @@ class RoundedButton(tk.Canvas):
         self.create_arc(w-r*2, h-r*2, w,   h,   start=270, extent=90,  fill=fill, outline=fill)
         self.create_rectangle(r, 0,   w-r, h,   fill=fill, outline=fill)
         self.create_rectangle(0, r,   w,   h-r, fill=fill, outline=fill)
-        fg = self._color_dis if self._disabled else self._color_fg
-        self.create_text(w//2, h//2, text=self._text, fill=fg,
-                         font=FONT_CHAT)
+        fg = DARK["text_dim"] if self._disabled else self._color_fg
+        self.create_text(w//2, h//2, text=self._text, fill=fg, font=FONT_CHAT)
 
     def _on_enter(self, _):
         if not self._disabled:
@@ -110,7 +112,9 @@ class RoundedButton(tk.Canvas):
             self._draw(self._color_hover)
             self._command()
 
-    def config(self, **kw):
+    def config(self, cnf=None, **kw):
+        if cnf:
+            kw.update(cnf)
         if "state" in kw:
             self._disabled = (kw["state"] == tk.DISABLED)
             fill = self._color_dis if self._disabled else self._color_normal
@@ -118,23 +122,23 @@ class RoundedButton(tk.Canvas):
         else:
             super().config(**kw)
 
-    # tk.Button 互換
-    def configure(self, **kw):
-        self.config(**kw)
+    def configure(self, cnf=None, **kw):
+        self.config(cnf, **kw)
 
 
 class P2PApp:
     def __init__(self, root):
         self.root = root
         self.root.title("P2P チャット")
-        self.root.geometry("520x650")
+        self.root.geometry("520x780")
         self.root.resizable(True, True)
         self.root.configure(bg=DARK["bg"])
 
         self.conn = None
         self.server_socket = None
-        self._peers = {}        # ip -> (hostname, last_seen)
+        self._peers = {}
         self._my_ip = self._get_local_ip()
+        self._pending_file = None   # ドロップ済み・送信待ちのファイルパス
 
         self._apply_ttk_style()
         self._build_ui()
@@ -143,7 +147,6 @@ class P2PApp:
     def _apply_ttk_style(self):
         style = ttk.Style()
         style.theme_use("default")
-        # Progressbar
         style.configure("dark.Horizontal.TProgressbar",
             troughcolor=DARK["panel"],
             background=DARK["accent"],
@@ -155,17 +158,15 @@ class P2PApp:
     # ================================================================ UI
 
     def _btn(self, parent, text, command, accent=False, **kw):
-        """角丸ボタン（Canvas 自作・幅はテキストから自動計算）"""
         return RoundedButton(parent, text=text, command=command,
                              accent=accent, height=32)
 
     def _label(self, parent, text, dim=False, **kw):
         fg = DARK["text_dim"] if dim else DARK["text"]
-        return tk.Label(parent, text=text,
-                        bg=parent["bg"], fg=fg, **kw)
+        return tk.Label(parent, text=text, bg=parent["bg"], fg=fg, **kw)
 
     def _build_ui(self):
-        D = DARK  # 短縮
+        D = DARK
 
         def frame(parent, **kw):
             return tk.Frame(parent, bg=D["panel"], **kw)
@@ -181,33 +182,29 @@ class P2PApp:
         conn_frame = lframe(self.root, "接続")
         conn_frame.pack(fill=tk.X, padx=10, pady=(10, 4))
 
-        # 検出リスト行
         list_row = frame(conn_frame)
         list_row.pack(fill=tk.X)
 
         self._label(list_row, "検出された相手:").pack(side=tk.LEFT)
 
-        # ドロップダウンメニュー（Menubutton でダーク統一）
         self.peer_var = tk.StringVar(value="（未検出）")
         self._peer_menu_obj = tk.Menu(list_row, tearoff=0,
-                                      bg=DARK["input_bg"], fg=DARK["text"],
-                                      activebackground=DARK["accent"],
-                                      activeforeground=DARK["accent_fg"],
+                                      bg=D["input_bg"], fg=D["text"],
+                                      activebackground=D["accent"],
+                                      activeforeground=D["accent_fg"],
                                       bd=0)
         self.peer_combo = tk.Menubutton(
             list_row, textvariable=self.peer_var,
             menu=self._peer_menu_obj,
-            bg=DARK["input_bg"], fg=DARK["text"],
-            activebackground=DARK["border"], activeforeground=DARK["text"],
+            bg=D["input_bg"], fg=D["text"],
+            activebackground=D["border"], activeforeground=D["text"],
             relief=tk.FLAT,
-            highlightthickness=1, highlightbackground=DARK["border"],
+            highlightthickness=1, highlightbackground=D["border"],
             width=24, anchor=tk.W, padx=6,
         )
         self.peer_combo.pack(side=tk.LEFT, padx=4)
-
         self._btn(list_row, "↺ 更新", self._refresh_peers).pack(side=tk.LEFT)
 
-        # 手動IP行
         manual_row = frame(conn_frame)
         manual_row.pack(fill=tk.X, pady=(6, 0))
 
@@ -221,17 +218,13 @@ class P2PApp:
         self._label(manual_row, "（リストに出ない場合）",
                     dim=True, font=FONT_SMALL).pack(side=tk.LEFT)
 
-        # ボタン行
         btn_row = frame(conn_frame)
         btn_row.pack(fill=tk.X, pady=(8, 0))
 
-        self.connect_btn = self._btn(btn_row, "接続する", self._connect,
-                                     accent=True, width=10)
+        self.connect_btn = self._btn(btn_row, "接続する", self._connect, accent=True)
         self.connect_btn.pack(side=tk.LEFT)
-
         self._label(btn_row, "または", dim=True).pack(side=tk.LEFT, padx=10)
-
-        self.wait_btn = self._btn(btn_row, "待機する", self._start_server, width=10)
+        self.wait_btn = self._btn(btn_row, "待機する", self._start_server)
         self.wait_btn.pack(side=tk.LEFT)
 
         self.status_label = tk.Label(conn_frame, text="● 未接続",
@@ -241,7 +234,7 @@ class P2PApp:
         # --- チャットエリア ---
         self.chat_area = scrolledtext.ScrolledText(
             self.root, state=tk.DISABLED, wrap=tk.WORD,
-            height=14, padx=8, pady=6, font=FONT_CHAT,
+            height=8, padx=8, pady=6, font=FONT_CHAT,
             bg=D["panel"], fg=D["text"],
             insertbackground=D["text"],
             selectbackground=D["border"],
@@ -267,7 +260,37 @@ class P2PApp:
                                             maximum=100)
         self.progress_bar.pack(fill=tk.X)
 
-        # --- 入力エリア ---
+        # --- ファイル送信エリア（ドラッグ＆ドロップ） ---
+        file_frame = lframe(self.root, "ファイル送信")
+        file_frame.pack(fill=tk.X, padx=10, pady=(4, 4))
+
+        self.drop_label = tk.Label(
+            file_frame,
+            text="ここにファイルをドラッグ＆ドロップ",
+            bg=D["input_bg"], fg=D["text_dim"],
+            relief=tk.FLAT, pady=14, font=FONT_SMALL,
+            cursor="hand2",
+        )
+        self.drop_label.pack(fill=tk.X, padx=2, pady=(0, 6))
+
+        # D&D登録
+        self.drop_label.drop_target_register(DND_FILES)
+        self.drop_label.dnd_bind("<<Drop>>",         self._on_file_drop)
+        self.drop_label.dnd_bind("<<DragEnter>>",    self._on_drag_enter)
+        self.drop_label.dnd_bind("<<DragLeave>>",    self._on_drag_leave)
+
+        file_btn_row = frame(file_frame)
+        file_btn_row.pack(fill=tk.X)
+
+        self.clear_file_btn = self._btn(file_btn_row, "✕ クリア", self._clear_pending_file)
+        self.clear_file_btn.pack(side=tk.LEFT)
+        self.clear_file_btn.config(state=tk.DISABLED)
+
+        self.file_send_btn = self._btn(file_btn_row, "送信", self._send_pending_file, accent=True)
+        self.file_send_btn.pack(side=tk.RIGHT)
+        self.file_send_btn.config(state=tk.DISABLED)
+
+        # --- テキスト入力エリア ---
         input_frame = tk.Frame(self.root, bg=D["bg"], padx=10, pady=6)
         input_frame.pack(fill=tk.X)
         input_frame.columnconfigure(0, weight=1)
@@ -281,10 +304,7 @@ class P2PApp:
 
         self.send_btn = self._btn(input_frame, "送信", self._send_message,
                                   accent=True, width=7)
-        self.send_btn.grid(row=0, column=1)
-
-        self.file_btn = self._btn(self.root, "📎  ファイルを送る", self._send_file)
-        self.file_btn.pack(pady=(0, 12))
+        self.send_btn.grid(row=0, column=1, pady=(0, 4))
 
     # ================================================================ ログ
 
@@ -293,6 +313,36 @@ class P2PApp:
         self.chat_area.insert(tk.END, text + "\n", tag)
         self.chat_area.config(state=tk.DISABLED)
         self.chat_area.see(tk.END)
+
+    def _log_file_received(self, filename, tmp_path, filesize):
+        """受信ファイルをクリック可能なボタンとしてチャットに追加"""
+        self.chat_area.config(state=tk.NORMAL)
+        self.chat_area.insert(tk.END, "  ", "system")
+        btn = tk.Button(
+            self.chat_area,
+            text=f"📎 {filename}  ({self._human_size(filesize)})   ← クリックして保存",
+            command=lambda p=tmp_path, n=filename: self._save_received_file(p, n),
+            bg=DARK["input_bg"], fg=DARK["accent"],
+            activebackground=DARK["border"], activeforeground=DARK["accent"],
+            relief=tk.FLAT, cursor="hand2", font=FONT_SMALL, bd=0, padx=8, pady=4,
+        )
+        self.chat_area.window_create(tk.END, window=btn)
+        self.chat_area.insert(tk.END, "\n", "system")
+        self.chat_area.config(state=tk.DISABLED)
+        self.chat_area.see(tk.END)
+
+    def _save_received_file(self, tmp_path, filename):
+        save_path = filedialog.asksaveasfilename(
+            initialfile=filename,
+            title="保存先を選んでください",
+        )
+        if not save_path:
+            return
+        try:
+            shutil.copy2(tmp_path, save_path)
+            self._log(f"保存しました: {save_path}")
+        except Exception as e:
+            self._log(f"保存失敗: {e}")
 
     def _set_status(self, text, color=None):
         fg = color or DARK["text"]
@@ -303,15 +353,63 @@ class P2PApp:
         self.root.after(0, self.connect_btn.config, {"state": tk.DISABLED})
         self.root.after(0, self.wait_btn.config,    {"state": tk.DISABLED})
 
+    # ================================================================ ドラッグ＆ドロップ
+
+    def _on_drag_enter(self, event):
+        self.drop_label.config(bg=DARK["drop_hover"], fg=DARK["text"])
+
+    def _on_drag_leave(self, event):
+        if self._pending_file:
+            self.drop_label.config(bg=DARK["input_bg"], fg=DARK["text"])
+        else:
+            self.drop_label.config(bg=DARK["input_bg"], fg=DARK["text_dim"])
+
+    def _on_file_drop(self, event):
+        path = event.data.strip()
+        # Windows: パスが {} で囲まれる場合がある
+        if path.startswith("{") and path.endswith("}"):
+            path = path[1:-1]
+        if not os.path.isfile(path):
+            self._log(f"ファイルが見つかりません: {path}")
+            return
+        self._pending_file = path
+        name = os.path.basename(path)
+        size = self._human_size(os.path.getsize(path))
+        self.drop_label.config(
+            text=f"📎 {name}  ({size})",
+            bg=DARK["input_bg"], fg=DARK["text"],
+        )
+        self.file_send_btn.config(state=tk.NORMAL)
+        self.clear_file_btn.config(state=tk.NORMAL)
+
+    def _clear_pending_file(self):
+        self._pending_file = None
+        self.drop_label.config(
+            text="ここにファイルをドラッグ＆ドロップ",
+            bg=DARK["input_bg"], fg=DARK["text_dim"],
+        )
+        self.file_send_btn.config(state=tk.DISABLED)
+        self.clear_file_btn.config(state=tk.DISABLED)
+
+    def _send_pending_file(self):
+        if not self.conn:
+            self._log("まだ接続されていません")
+            return
+        if not self._pending_file:
+            return
+        filepath = self._pending_file
+        self._clear_pending_file()
+        threading.Thread(target=self._send_file_thread,
+                         args=(filepath,), daemon=True).start()
+
     # ================================================================ 自動検出
 
     def _start_discovery(self):
-        threading.Thread(target=self._broadcast_loop,  daemon=True).start()
+        threading.Thread(target=self._broadcast_loop,   daemon=True).start()
         threading.Thread(target=self._discovery_listen, daemon=True).start()
         self._cleanup_peers()
 
     def _broadcast_loop(self):
-        """2秒ごとに自分の存在をブロードキャスト"""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         hostname = socket.gethostname().encode("utf-8")
@@ -324,7 +422,6 @@ class P2PApp:
             time.sleep(2)
 
     def _discovery_listen(self):
-        """他のインスタンスのブロードキャストを受信"""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("", DISC_PORT))
@@ -335,7 +432,7 @@ class P2PApp:
                     continue
                 ip = addr[0]
                 if ip == self._my_ip:
-                    continue        # 自分自身は無視
+                    continue
                 hostname = data[len(DISC_MSG) + 1:].decode("utf-8", errors="replace")
                 self._peers[ip] = (hostname, time.time())
                 self.root.after(0, self._refresh_peers)
@@ -343,7 +440,6 @@ class P2PApp:
                 pass
 
     def _cleanup_peers(self):
-        """10秒以上応答がない相手をリストから除去"""
         now = time.time()
         expired = [ip for ip, (_, t) in self._peers.items() if now - t > 10]
         for ip in expired:
@@ -366,14 +462,12 @@ class P2PApp:
             self.peer_var.set("（未検出）")
 
     def _selected_ip(self):
-        # 手動入力を優先
         manual = self.ip_entry.get().strip()
         if manual:
             return manual
         val = self.peer_var.get()
         if not val:
             return None
-        # "hostname  (192.168.x.x)" から IP を取り出す
         return val.rsplit("(", 1)[-1].rstrip(")")
 
     # ================================================================ サーバー待機
@@ -445,13 +539,16 @@ class P2PApp:
                     filename  = self._recv_exact(fname_len).decode("utf-8")
                     filesize  = struct.unpack(">Q", self._recv_exact(8))[0]
                     self.root.after(0, self._log,
-                        f"ファイル受信開始: {filename}  ({self._human_size(filesize)})")
+                        f"ファイル受信中: {filename}  ({self._human_size(filesize)})")
 
-                    save_path = self._safe_save_path(
-                        os.path.join(DOWNLOADS, filename))
+                    # 一時ファイルに保存
+                    suffix = os.path.splitext(filename)[1]
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+                    tmp_path = tmp.name
+                    tmp.close()
 
                     received = 0
-                    with open(save_path, "wb") as f:
+                    with open(tmp_path, "wb") as f:
                         while received < filesize:
                             chunk = self._recv_exact(
                                 min(CHUNK_SIZE, filesize - received))
@@ -463,7 +560,8 @@ class P2PApp:
                             self.root.after(0, self._update_progress,
                                             pct, filename, received, filesize)
 
-                    self.root.after(0, self._log, f"受信完了 → {save_path}")
+                    self.root.after(0, self._log_file_received,
+                                    filename, tmp_path, filesize)
                     self.root.after(0, self._reset_progress)
 
             except Exception as e:
@@ -497,20 +595,10 @@ class P2PApp:
         except Exception as e:
             self._log(f"送信失敗: {e}")
 
-    def _send_file(self):
-        if not self.conn:
-            self._log("まだ接続されていません")
-            return
-        filepath = filedialog.askopenfilename(title="送るファイルを選んでください")
-        if not filepath:
-            return
-        threading.Thread(target=self._send_file_thread,
-                         args=(filepath,), daemon=True).start()
-
     def _send_file_thread(self, filepath):
         try:
-            filename   = os.path.basename(filepath)
-            filesize   = os.path.getsize(filepath)
+            filename    = os.path.basename(filepath)
+            filesize    = os.path.getsize(filepath)
             fname_bytes = filename.encode("utf-8")
             self.root.after(0, self._log,
                 f"ファイル送信開始: {filename}  ({self._human_size(filesize)})")
@@ -570,22 +658,8 @@ class P2PApp:
         except Exception:
             return "127.0.0.1"
 
-    @staticmethod
-    def _safe_save_path(path):
-        if not os.path.exists(path):
-            return path
-        base, ext = os.path.splitext(path)
-        i = 1
-        while True:
-            candidate = f"{base}_{i}{ext}"
-            if not os.path.exists(candidate):
-                return candidate
-            i += 1
-
 
 if __name__ == "__main__":
-    import sys
-    # Windows: 高DPI対応（ぼやけ防止）
     if sys.platform == "win32":
         try:
             from ctypes import windll
@@ -593,9 +667,8 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    root = tk.Tk()
+    root = TkinterDnD.Tk()
 
-    # ウィンドウアイコン設定
     try:
         icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
         if os.path.exists(icon_path):
@@ -604,7 +677,6 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    # Windows: タスクバーアイコンも icon.ico に差し替え
     if sys.platform == "win32":
         try:
             ico_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
