@@ -248,6 +248,21 @@ class P2PApp:
         self.chat_area.tag_config("system", foreground=D["system_msg"],
                                   font=(*FONT_SMALL, "italic"))
 
+        # テキスト選択・コピーを有効化
+        self.chat_area.bind("<Button-1>", lambda e: self.chat_area.focus_set())
+        copy_key = "<Command-c>" if sys.platform == "darwin" else "<Control-c>"
+        self.chat_area.bind(copy_key, self._copy_selected)
+
+        # 右クリックメニュー
+        self._chat_menu = tk.Menu(self.chat_area, tearoff=0,
+                                  bg=DARK["input_bg"], fg=DARK["text"],
+                                  activebackground=DARK["accent"],
+                                  activeforeground=DARK["accent_fg"])
+        self._chat_menu.add_command(label="コピー", command=self._copy_selected)
+        self._chat_menu.add_command(label="すべて選択", command=self._select_all)
+        btn = "<Button-2>" if sys.platform == "darwin" else "<Button-3>"
+        self.chat_area.bind(btn, self._show_chat_menu)
+
         # --- プログレスバー ---
         prog_frame = tk.Frame(self.root, bg=D["bg"], padx=10)
         prog_frame.pack(fill=tk.X)
@@ -309,6 +324,24 @@ class P2PApp:
         self.send_btn.grid(row=0, column=1, pady=(0, 4))
 
     # ================================================================ ログ
+
+    def _copy_selected(self, event=None):
+        try:
+            text = self.chat_area.get(tk.SEL_FIRST, tk.SEL_LAST)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except tk.TclError:
+            pass  # 選択なし
+        return "break"
+
+    def _select_all(self, event=None):
+        self.chat_area.tag_add(tk.SEL, "1.0", tk.END)
+        self.chat_area.mark_set(tk.INSERT, "1.0")
+        self.chat_area.see(tk.INSERT)
+
+    def _show_chat_menu(self, event):
+        self.chat_area.focus_set()
+        self._chat_menu.tk_popup(event.x_root, event.y_root)
 
     def _log(self, text, tag="system"):
         self.chat_area.config(state=tk.NORMAL)
