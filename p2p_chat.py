@@ -136,9 +136,10 @@ class P2PApp:
 
         self.conn = None
         self.server_socket = None
-        self._peers = {}
+        self._peers = {}            # ip -> (hostname, last_seen, is_waiting)
         self._my_ip = self._get_local_ip()
-        self._pending_file = None   # ドロップ済み・送信待ちのファイルパス
+        self._pending_file = None
+        self._my_state = "idle"     # "idle" or "waiting"
 
         self._apply_ttk_style()
         self._build_ui()
@@ -223,6 +224,7 @@ class P2PApp:
 
         self.connect_btn = self._btn(btn_row, "接続する", self._connect, accent=True)
         self.connect_btn.pack(side=tk.LEFT)
+        self.connect_btn.config(state=tk.DISABLED)
         self._label(btn_row, "または", dim=True).pack(side=tk.LEFT, padx=10)
         self.wait_btn = self._btn(btn_row, "待機する", self._start_server)
         self.wait_btn.pack(side=tk.LEFT)
@@ -349,10 +351,11 @@ class P2PApp:
         self.status_label.config(text=f"● {text}", fg=fg)
 
     def _on_disconnected(self):
+        self._my_state = "idle"
         self._set_status("切断 — 再接続できます", DARK["err"])
-        self.connect_btn.config(state=tk.NORMAL)
         self.wait_btn.config(state=tk.NORMAL)
         self.conn = None
+        self._update_connect_btn()
 
     def _cleanup_connection(self):
         """既存の接続・サーバーソケットを閉じる"""
@@ -370,6 +373,7 @@ class P2PApp:
             self.server_socket = None
 
     def _set_connected(self, ip):
+        self._my_state = "idle"
         self.root.after(0, self._set_status, f"接続中: {ip}", DARK["ok"])
         self.root.after(0, self.connect_btn.config, {"state": tk.DISABLED})
         self.root.after(0, self.wait_btn.config,    {"state": tk.DISABLED})
@@ -434,9 +438,10 @@ class P2PApp:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         hostname = socket.gethostname().encode("utf-8")
-        payload = DISC_MSG + b"|" + hostname
         while True:
             try:
+                state = self._my_state.encode("utf-8")
+                payload = DISC_MSG + b"|" + hostname + b"|" + state
                 sock.sendto(payload, ("255.255.255.255", DISC_PORT))
             except Exception:
                 pass
@@ -454,33 +459,47 @@ class P2PApp:
                 ip = addr[0]
                 if ip == self._my_ip:
                     continue
-                hostname = data[len(DISC_MSG) + 1:].decode("utf-8", errors="replace")
-                self._peers[ip] = (hostname, time.time())
+                parts = data[len(DISC_MSG) + 1:].decode("utf-8", errors="replace").split("|")
+                hostname   = parts[0]
+                is_waiting = len(parts) > 1 and parts[1] == "waiting"
+                self._peers[ip] = (hostname, time.time(), is_waiting)
                 self.root.after(0, self._refresh_peers)
             except Exception:
                 pass
 
     def _cleanup_peers(self):
         now = time.time()
-        expired = [ip for ip, (_, t) in self._peers.items() if now - t > 10]
+        expired = [ip for ip, (_, t, __) in self._peers.items() if now - t > 10]
         for ip in expired:
             del self._peers[ip]
         self._refresh_peers()
         self.root.after(6000, self._cleanup_peers)
 
     def _refresh_peers(self):
-        entries = [f"{hostname}  ({ip})"
-                   for ip, (hostname, _) in self._peers.items()]
+        entries = [(f"{hostname}  ({ip})", is_waiting)
+                   for ip, (hostname, _, is_waiting) in self._peers.items()]
         self._peer_menu_obj.delete(0, tk.END)
         if entries:
-            for entry in entries:
+            for label, _ in entries:
                 self._peer_menu_obj.add_command(
-                    label=entry,
-                    command=lambda v=entry: self.peer_var.set(v))
-            if self.peer_var.get() not in entries:
-                self.peer_var.set(entries[0])
+                    label=label,
+                    command=lambda v=label: (self.peer_var.set(v), self._update_connect_btn()))
+            labels = [e[0] for e in entries]
+            if self.peer_var.get() not in labels:
+                self.peer_var.set(labels[0])
         else:
             self.peer_var.set("（未検出）")
+        self._update_connect_btn()
+
+    def _update_connect_btn(self):
+        """選択中の相手が待機中のときだけ「接続する」を有効にする"""
+        if self.conn:
+            return
+        ip = self._selected_ip()
+        if ip and ip in self._peers and self._peers[ip][2]:
+            self.connect_btn.config(state=tk.NORMAL)
+        else:
+            self.connect_btn.config(state=tk.DISABLED)
 
     def _selected_ip(self):
         manual = self.ip_entry.get().strip()
@@ -495,6 +514,7 @@ class P2PApp:
 
     def _start_server(self):
         self._cleanup_connection()
+        self._my_state = "waiting"
         self.wait_btn.config(state=tk.DISABLED)
         self.connect_btn.config(state=tk.DISABLED)
         self._set_status("待機中...", DARK["warn"])
